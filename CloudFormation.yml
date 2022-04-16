@@ -1,0 +1,323 @@
+AWSTemplateFormatVersion: 2010-09-09
+Resources:
+  LambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import base64
+          import time
+          import urllib3
+          http = urllib3.PoolManager()
+
+          def lambda_handler(event, context):
+          
+            def create_ec2_instance():
+                ec2_client = boto3.client("ec2", region_name="us-east-1")
+                response = ec2_client.describe_key_pairs()
+
+                exists = False
+                for i in response['KeyPairs']:
+                    if i['KeyName'] == 'ec2-key-pair':
+                        exists = True
+                if not exists:
+                    response = ec2_client.create_key_pair(KeyName='ec2-key-pair')
+
+                instance_id = ''
+                ec2 = boto3.resource('ec2')
+                c = boto3.client('iam')
+
+                policy = {"Version": "2012-10-17", "Statement": [
+                    {"Effect": "Allow", "Principal": {"Service": "ec2.amazonaws.com"}, "Action": "sts:AssumeRole"}]}
+
+                assume_role_policy_document = json.dumps(policy)
+                instances = ec2.instances.filter(Filters=[{'Name': 'instance-state-name', 'Values': ['running']}])
+
+                for instance in instances:
+                    instance_id = instance.id
+
+                if instance_id == '':
+                    instance_profile = c.create_instance_profile(InstanceProfileName='myinstanceprofile')
+                    role = c.create_role(RoleName='myrole', AssumeRolePolicyDocument=assume_role_policy_document)
+                    c.add_role_to_instance_profile(InstanceProfileName='myinstanceprofile', RoleName='myrole')
+                    c.put_role_policy(RoleName='myrole', PolicyName='mypolicy',
+                                      PolicyDocument='{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":["s3:*","ssm:*","dynamodb:*"],"Resource":"*"}}')
+                    time.sleep(8)
+                    instances = ec2_client.run_instances(
+                        ImageId="ami-0c02fb55956c7d316",
+                        MinCount=1,
+                        MaxCount=1,
+                        InstanceType="t2.micro",
+                        KeyName="ec2-key-pair",
+                        IamInstanceProfile={'Name': 'myinstanceprofile'}
+                    )
+                    instance_id = instances["Instances"][0]["InstanceId"]
+
+            def run_ec2_script():
+                running_status = ec2.Instance(instance_id)
+
+                while (True):
+                    if running_status.state['Name'] == 'running':
+                        ec2_status = ec2_client.describe_instance_status(InstanceIds=[instance_id])
+                        if ec2_status['InstanceStatuses'][0]['SystemStatus']['Details'][0]['Status'] == "passed":
+                          print("working")
+                          break
+
+                ssm = boto3.client('ssm')
+                libraries_install = 'pip3 install boto3 requests'
+                ssm.send_command(InstanceIds=[str(instance_id)], DocumentName='AWS-RunShellScript',
+                                Parameters={'commands': [libraries_install]})
+                script_dowload = 'aws s3 cp s3://akhi-fovus-scripts/ec2Script.py /home/ec2-user/.'
+                ssm.send_command(InstanceIds=[str(instance_id)], DocumentName='AWS-RunShellScript',
+                                Parameters={'commands': [script_dowload]})
+                run_script = 'python3 /home/ec2-user/ec2Script.py ' + str(new_id)
+                ssm.send_command(InstanceIds=[str(instance_id)], DocumentName='AWS-RunShellScript',
+                                Parameters={'commands': [run_script]})
+
+            event_body = json.loads(event["body"])
+            content_decoded = event_body["fileData"]
+            inputText = event_body["inputText"]
+            file_name = event_body["fileName"]
+
+            dynamo_res = boto3.resource('dynamodb')
+            s3_res = boto3.client('s3')
+
+            bucket_name = 'akhi-input-bucket'
+            table = dynamo_res.Table('Dynamo_input-s3-db')
+
+            s3_res.put_object(Bucket=bucket_name, Key=file_name, Body=content_decoded)
+            s3_path = s3_res.generate_presigned_url(ClientMethod='get_object', Params={'Bucket': bucket_name, 'Key': file_name})
+
+            new_id = table.scan()['Count'] + 1
+            res = table.put_item( Item={ 'id': new_id, 'inputS3Path': s3_path, 'inputText': inputText })
+
+            #create_ec2_instance()
+            #run_ec2_script()
+
+            output_bucket_name='akhi-output-bucket'
+            output_table_name='Dynamo_output-s3-db'
+            
+            response=table.get_item(Key={"id":new_id})
+            inputText=response['Item']['inputText']
+            file=http.request('GET',response['Item']['inputS3Path'])
+  
+            s3_res.put_object(Bucket=output_bucket_name,Key="output_"+str(new_id)+'.txt',Body=file.data.decode('utf-8')+" : " + inputText)
+            out_s3_path = s3_res.generate_presigned_url(ClientMethod='get_object',Params={'Bucket':output_bucket_name,'Key':"output_"+str(new_id)+'.txt'})
+            
+            output_table = dynamo_res.Table(output_table_name)
+            res = output_table.put_item(Item={ 'id':new_id, 'outputS3Path':out_s3_path })
+            return { 'statusCode': 200 }
+      FunctionName:
+        Ref: LambdaFuncName
+      Timeout: 900
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt IAMRole.Arn
+    DependsOn:
+      - DynamoDBInTable
+  DynamoDBInTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName:
+        Ref: DynamoDBTableName
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: N
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: '5'
+        WriteCapacityUnits: '5'
+    DependsOn:
+      - IAMRole
+  DynamoDBOutTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName:
+        Ref: DynamoDBTableName1
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: N
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: '5'
+        WriteCapacityUnits: '5'
+    DependsOn:
+      - IAMRole
+  S3InService:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: 
+        Ref: S3InputBucketName
+    DependsOn:
+      - IAMRole
+  S3OutService:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: 
+        Ref: S3InputOutputName
+    DependsOn:
+      - IAMRole
+  APIGatewayRestAPI:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name:
+        Ref: APIName
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+    DependsOn:
+      - LambdaFunction
+  APIGatewayResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ParentId: !GetAtt
+        - APIGatewayRestAPI
+        - RootResourceId
+      PathPart:
+        Ref: LambdaFuncName
+    DependsOn:
+      - APIGatewayRestAPI
+  APIGatewayMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref APIGatewayResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      MethodResponses:
+        - StatusCode: 200
+      Integration:
+        Type: AWS_PROXY
+        IntegrationResponses:
+          - StatusCode: 200
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations
+          - lambdaArn: !GetAtt LambdaFunction.Arn
+    DependsOn:
+      - APIGatewayResource
+  APIGatewayDeployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      StageName:
+        Ref: EnvironmentName
+    DependsOn:
+      - APIGatewayMethod
+  APIGatewayPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt LambdaFunction.Arn
+      Principal: apigateway.amazonaws.com
+    DependsOn:
+      - APIGatewayDeployment
+  IAMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version:  2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: Policy_api-lambda-db
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:*'
+                  - 'ec2:*'
+                  - 'ssm:*'
+                  - 'iam:*'
+                  - 'dynamodb:BatchGetItem'
+                  - 'dynamodb:BatchWriteItem'
+                  - 'dynamodb:TagResource'
+                  - 'dynamodb:UntagResource'
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:DeleteItem'
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:Scan'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:UpdateItem'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:CreateLogGroup'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+  EC2IAMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version:  2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: Policy_ec2-lambda-db
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:*'
+                  - 'ssm:*'
+                  - 'dynamodb:BatchGetItem'
+                  - 'dynamodb:BatchWriteItem'
+                  - 'dynamodb:TagResource'
+                  - 'dynamodb:UntagResource'
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:DeleteItem'
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:Scan'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:UpdateItem'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:CreateLogGroup'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+Parameters:
+  LambdaFuncName:
+    Type: String
+    Default: Lambda_input-processing
+  DynamoDBTableName:
+    Type: String
+    Default: Dynamo_input-s3-db
+  DynamoDBTableName1:
+    Type: String
+    Default: Dynamo_output-s3-db
+  APIName:
+    Type: String
+    Default: API_api-lambda-db
+  S3InputBucketName:
+    Type: String
+    Default: akhi-input-bucket
+  S3InputOutputName:
+    Type: String
+    Default: akhi-output-bucket
+  EnvironmentName:
+    Type: String
+    Default: Prod

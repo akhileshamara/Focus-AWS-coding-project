@@ -1,0 +1,83 @@
+<!doctype html>
+<html class="no-js" lang="">
+
+<head>
+  <meta charset="utf-8">
+  <title>Fovus Coding Challenge</title>
+  <link
+    rel="stylesheet"
+    href="//netdna.bootstrapcdn.com/bootstrap/3.0.3/css/bootstrap.min.css"
+  />
+  <script src="//ajax.googleapis.com/ajax/libs/jquery/2.0.3/jquery.min.js"></script>
+</head>
+
+<body>
+
+  <div class="container">
+    <div class="col-sm-6 col-sm-offset-3">
+      <h1 style="padding: 50px">Fovus</h1>
+
+      <form method="post" action="" enctype="application/json" id="myform">
+        <div id="name-group" class="form-group">
+          <label for="inputText">Enter Input Text:</label>
+          <input type="text" class="form-control" id="inputText" name="inputText" placeholder="Enter Input text:" />
+        </div>
+
+        <div id="fileUpload-group" class="form-group">
+          <input type="file" class="form-control" id="fileUpload" name="fileUpload" />
+        </div>
+
+        <button type="button" class="btn btn-success" value="Upload" id="btnUpload">
+          Upload
+        </button>
+      </form>
+    </div>
+  </div>
+
+
+</body>
+
+  <script>
+    $(document).ready(function() {
+
+      $("#btnUpload").click(function () {
+
+
+        var fileReader = new FileReader();
+        var files = $('#fileUpload').prop('files')[0];
+
+        var text = $('#inputText').val();
+
+        var dataFile;
+
+
+
+        var success = function ( content ) {
+          dataFile = content;
+
+          const JSONData = {'fileData':dataFile,'inputText':text,'fileName':files.name}
+
+          const final = JSON.stringify(JSONData)
+// update URL here
+          fetch('https://0p1ed13fpe.execute-api.us-east-1.amazonaws.com/Prod/Lambda_input-processing', { // Your POST endpoint
+            method: 'POST',
+            body:final
+          }).then(
+            response => response.json() // if the response is a JSON object
+          ).then(
+            success => console.log(success) // Handle the success response object
+          ).catch(
+            error => console.log(error) // Handle the error response object
+          );
+        }
+
+        fileReader.onload = function ( evt ) { success( evt.target.result ) };
+        fileReader.readAsText( files );
+
+      });
+    });
+  </script>
+
+</body>
+
+</html>
